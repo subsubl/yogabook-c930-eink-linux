@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Yoga Book C930 E-Ink Control
+Comment=Control E-Ink keyboard, display modes, and wallpapers on Lenovo Yoga Book C930
+Exec=/usr/local/bin/yogabook-eink-gui
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+Keywords=yogabook;eink;keyboard;lenovo;c930;

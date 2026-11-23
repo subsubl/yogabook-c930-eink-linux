@@ -1,0 +1,5 @@
+# Grant logged-in desktop users and plugdev group access to Yoga Book C930 ITE8951 T-CON
+# 1. Raw USB bulk control interface (048d:8951)
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="8951", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+# 2. HID raw interfaces (hidraw0/1/4) for E-Ink touch (0x90), multitouch (0x0c), and panel buttons (0x10/0x20)
+KERNEL=="hidraw*", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="8951", MODE="0666", GROUP="plugdev", TAG+="uaccess"

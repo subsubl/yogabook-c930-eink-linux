@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""CLI tool for Yoga Book C930 (YB-J912) E-Ink & Keyboard control."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from yogabook_eink.image_render import (  # noqa: E402
+    DITHER_MODES,
+    generate_template,
+    normalize_dither_mode,
+    prepare_image_file,
+)
+from yogabook_eink.protocol import (  # noqa: E402
+    REG_DISPLAY_CFG,
+    REG_PANEL_MODE,
+    SCENARIO_NAMES,
+    WAVEFORM_DU2,
+    WAVEFORM_GC16,
+    WAVEFORM_GL16,
+    WAVEFORM_INIT,
+    Ite8951Controller,
+)
+from yogabook_eink.tone_lut import (  # noqa: E402
+    CONTRAST_MAX,
+    CONTRAST_MIN,
+    LIGHTNESS_MAX,
+    LIGHTNESS_MIN,
+)
+from yogabook_eink.usb_lib import UsbError  # noqa: E402
+
+WF_MAP = {
+    "init": WAVEFORM_INIT,
+    "du2": WAVEFORM_DU2,
+    "gc16": WAVEFORM_GC16,
+    "gl16": WAVEFORM_GL16,
+}
+
+
+def _cli_dither_mode(value: str) -> str:
+    try:
+        return normalize_dither_mode(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _cli_int_range(lo: int, hi: int, name: str):
+    def _parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer in [{lo}, {hi}]") from exc
+        if parsed < lo or parsed > hi:
+            raise argparse.ArgumentTypeError(f"{name} must be between {lo} and {hi} (got {parsed})")
+        return parsed
+
+    return _parse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Control the Lenovo Yoga Book C930 E-Ink display & keyboard over USB."
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="Query panel system info, scenario, and registers")
+    sub.add_parser("init", help="Run 4x GET_SYS doorknock initialization")
+    p_kb = sub.add_parser("kb", help="Enable / restore E-Ink firmware keyboard")
+    p_kb.add_argument(
+        "--style",
+        choices=["classic_black", "classic_white", "modern_black", "modern_white"],
+        default=None,
+        help="Optional native Lenovo keyboard & touchpad style (flashes .bin.cap to T-CON)",
+    )
+    sub.add_parser("draw", help="Switch to Owner-Draw / E-Ink Display mode")
+    sub.add_parser("mt", help="Arm Windows-validated Multitouch / Pen-Mouse mode")
+    sub.add_parser("leave-kb", help="Minimal leave-keyboard command")
+    sub.add_parser("drain", help="Drain stale bulk IN packets")
+
+    p_clear = sub.add_parser("clear", help="Clear screen (white/black) with INIT refresh")
+    p_clear.add_argument("--black", action="store_true", help="Fill black instead of white")
+
+    p_tpl = sub.add_parser("template", help="Display a built-in template")
+    p_tpl.add_argument("kind", choices=["white", "black", "ruled", "dotgrid", "banner"])
+    p_tpl.add_argument("--waveform", choices=list(WF_MAP), default="gc16")
+    p_tpl.add_argument("--rotate-180", action="store_true")
+
+    p_img = sub.add_parser("image", help="Display an image file on the E-Ink screen")
+    p_img.add_argument("path", help="Path to PNG/JPG/BMP image")
+    p_img.add_argument("--fit", choices=["contain", "cover"], default="contain")
+    p_img.add_argument("--waveform", choices=list(WF_MAP), default="gc16")
+    p_img.add_argument("--dither", action="store_true", help="Legacy 1-bit Floyd-Steinberg dither")
+    p_img.add_argument(
+        "--dither-mode",
+        type=_cli_dither_mode,
+        default=None,
+        help=(
+            "Dithering mode ("
+            + ", ".join(DITHER_MODES)
+            + "; or slugs: grayscale-16, bayer-4x4, bayer-8x8, fs, atkinson)"
+        ),
+    )
+    p_img.add_argument(
+        "--lightness",
+        type=_cli_int_range(LIGHTNESS_MIN, LIGHTNESS_MAX, "lightness"),
+        default=0,
+        metavar=f"{{{LIGHTNESS_MIN}..{LIGHTNESS_MAX}}}",
+        help=f"Glider tone LUT lightness ({LIGHTNESS_MIN}..+{LIGHTNESS_MAX}, default 0)",
+    )
+    p_img.add_argument(
+        "--contrast",
+        type=_cli_int_range(CONTRAST_MIN, CONTRAST_MAX, "contrast"),
+        default=0,
+        metavar=f"{{{CONTRAST_MIN}..{CONTRAST_MAX}}}",
+        help=f"Glider tone LUT contrast ({CONTRAST_MIN}..+{CONTRAST_MAX}, default 0)",
+    )
+    p_img.add_argument("--invert", action="store_true")
+    p_img.add_argument("--rotate-180", action="store_true")
+
+    p_wf = sub.add_parser("waveform", help="Set active panel waveform")
+    p_wf.add_argument("mode", choices=list(WF_MAP))
+
+    sub.add_parser(
+        "monitor",
+        help="Live-print raw HID reports (0x10/0x20/0x90) when you tap the E-Ink screen/buttons",
+    )
+    sub.add_parser(
+        "menu",
+        help="Draw the interactive 8-tile Settings Menu on E-Ink and handle finger/stylus taps",
+    )
+    sub.add_parser(
+        "daemon",
+        help="Background daemon: tap top-right Settings icon on E-Ink keyboard to open E-Ink Settings Menu",
+    )
+    p_mat = sub.add_parser("matrix", help="Run Matrix Digital Rain screensaver on the E-Ink screen")
+    p_mat.add_argument("--light", action="store_true", help="Black text on white paper background")
+    sub.add_parser("doom", help="Play 3D E-Ink DOOM directly on the E-Ink screen with touch controls")
+    return parser
+
+
+def cmd_image(args: argparse.Namespace, controller_cls=Ite8951Controller) -> int:
+    try:
+        _, packed = prepare_image_file(
+            args.path,
+            fit_mode=args.fit,
+            invert=args.invert,
+            rotate_180=args.rotate_180,
+            dither_1bit=args.dither,
+            dither_mode=args.dither_mode,
+            lightness=args.lightness,
+            contrast=args.contrast,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"Image Error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with controller_cls() as ctrl:
+            ctrl.enable_draw_mode()
+            ctrl.display_image_bytes(packed, waveform=WF_MAP[args.waveform])
+            print(f"Displayed image '{args.path}'.")
+    except UsbError as exc:
+        print(f"USB Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.cmd == "monitor":
+        import time
+        from yogabook_eink.hid_listener import EinkHidListener
+
+        def _on_raw(dev: str, data: bytes) -> None:
+            print(f"[{time.strftime('%H:%M:%S')}] {dev} len={len(data)} id=0x{data[0]:02x} hex={data.hex(' ')}", flush=True)
+
+        def _on_touch(ev) -> None:
+            if ev.is_down or ev.is_up:
+                st = "DOWN" if ev.is_down else "UP"
+                print(f"  -> TOUCH {st} panel=({ev.panel_x},{ev.panel_y}) raw=({ev.raw_x},{ev.raw_y}) z={ev.pressure}", flush=True)
+
+        listener = EinkHidListener(on_touch=_on_touch, on_raw=_on_raw)
+        ok, msg = listener.start()
+        print(msg, flush=True)
+        if not ok:
+            return 1
+        print("Tap the E-Ink screen or Settings/Homebar buttons (Ctrl+C to stop)...", flush=True)
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            listener.stop()
+        return 0
+
+    if args.cmd == "daemon":
+        from yogabook_eink.daemon import EinkSettingsDaemon
+
+        return EinkSettingsDaemon().run_forever()
+
+    if args.cmd == "matrix":
+        import threading
+        from yogabook_eink.matrix_saver import run_matrix_screensaver
+
+        stop_ev = threading.Event()
+        print("Running Matrix screensaver on E-Ink (Ctrl+C to stop)...", flush=True)
+        try:
+            run_matrix_screensaver(stop_ev, dark_bg=not args.light)
+        except KeyboardInterrupt:
+            stop_ev.set()
+        return 0
+
+    if args.cmd == "doom":
+        import threading
+        from yogabook_eink.doom_eink import run_eink_doom
+
+        stop_ev = threading.Event()
+        print("Launching E-Ink DOOM! Tap ◀ ▲ ▼ ▶ and FIRE! on the E-Ink screen (or EXIT / Ctrl+C).", flush=True)
+        try:
+            run_eink_doom(stop_ev, restore_kb_on_exit=True, on_status=lambda m: print(m, flush=True))
+        except KeyboardInterrupt:
+            stop_ev.set()
+        return 0
+
+    if args.cmd == "menu":
+        import time
+        from yogabook_eink.eink_menu import EinkOnScreenMenu
+        from yogabook_eink.hid_listener import EinkHidListener
+        from yogabook_eink.protocol import PANEL_HEIGHT, PANEL_WIDTH, TP_AREA_TOUCH_PEN
+
+        menu = EinkOnScreenMenu()
+        _, packed = menu.render()
+        with Ite8951Controller() as ctrl:
+            ctrl.enable_draw_mode()
+            ctrl.clear_handwriting_region()
+            ctrl.set_tp_area(0, 0, PANEL_WIDTH, PANEL_HEIGHT, index=0, flag=TP_AREA_TOUCH_PEN)
+            ctrl.display_image_bytes(packed, PANEL_WIDTH, PANEL_HEIGHT, waveform=WAVEFORM_GC16)
+        print("Interactive E-Ink Settings Menu active! Tap tiles on the E-Ink screen (Ctrl+C to exit).", flush=True)
+
+        last_tap = [0.0]
+
+        def _on_touch(ev) -> None:
+            if not ev.is_down:
+                return
+            now = time.monotonic()
+            if now - last_tap[0] < 0.7:
+                return
+            tile = menu.hit_test(ev.panel_x, ev.panel_y)
+            if not tile:
+                return
+            last_tap[0] = now
+            print(f"Tapped tile: {tile.action_id} ({tile.title})", flush=True)
+            with Ite8951Controller() as ctrl:
+                if tile.action_id == "kb":
+                    ctrl.enable_keyboard()
+                    print("Switched to Keyboard mode.", flush=True)
+                elif tile.action_id == "mt":
+                    ctrl.enable_multitouch_mode()
+                    print("Armed Multitouch mode.", flush=True)
+                elif tile.action_id in ("ruled", "dotgrid"):
+                    _, p = generate_template(tile.action_id)
+                    ctrl.display_image_bytes(p, PANEL_WIDTH, PANEL_HEIGHT, waveform=WAVEFORM_GC16)
+                elif tile.action_id == "clear_init":
+                    ctrl.clear_screen(fill_byte=0xFF, waveform=WAVEFORM_INIT)
+                    _, p = menu.render("Ghosting cleared!")
+                    ctrl.display_image_bytes(p, PANEL_WIDTH, PANEL_HEIGHT, waveform=WAVEFORM_GC16)
+
+        listener = EinkHidListener(on_touch=_on_touch)
+        ok, msg = listener.start()
+        print(msg, flush=True)
+        if not ok:
+            return 1
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            listener.stop()
+        return 0
+
+    if args.cmd == "image":
+        return cmd_image(args)
+
+    if args.cmd == "template":
+        _, packed = generate_template(args.kind, rotate_180=args.rotate_180)
+        try:
+            with Ite8951Controller() as ctrl:
+                ctrl.enable_draw_mode()
+                ctrl.display_image_bytes(packed, waveform=WF_MAP[args.waveform])
+                print(f"Displayed template '{args.kind}'.")
+        except UsbError as exc:
+            print(f"USB Error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    try:
+        with Ite8951Controller() as ctrl:
+            if args.cmd == "status":
+                info = ctrl.get_system_info()
+                scen = ctrl.get_scenario()
+                cfg = ctrl.read_reg(REG_DISPLAY_CFG)
+                pm = ctrl.read_reg(REG_PANEL_MODE)
+                print(f"Signature:    {info.signature_str}")
+                print(f"Resolution:   {info.width}x{info.height} (EPD type={info.epd_type})")
+                print(f"Touchpad FW:  v{info.tp_version_str} (max {info.tp_x_max}x{info.tp_y_max})")
+                print(f"Scenario:     {SCENARIO_NAMES.get(scen, scen)}")
+                print(f"display_cfg:  0x{cfg:08x}")
+                print(f"panel_mode:   0x{pm:08x}")
+            elif args.cmd == "init":
+                info = ctrl.init_panel()
+                print(f"Initialized {info.width}x{info.height} panel (TP v{info.tp_version_str}).")
+            elif args.cmd == "kb":
+                from yogabook_eink.config import EinkSettings
+
+                target_style = getattr(args, "style", None)
+                if target_style:
+                    settings = EinkSettings.load()
+                    settings.keyboard_style = target_style
+                    settings.save()
+                scen = ctrl.exit_to_keyboard(style=target_style)
+                print(f"Keyboard restored and refreshed (scenario={scen}).")
+            elif args.cmd == "draw":
+                scen = ctrl.enable_draw_mode()
+                print(f"Owner-draw mode enabled (scenario={scen}).")
+            elif args.cmd == "mt":
+                scen, cfg = ctrl.enable_multitouch_mode()
+                print(f"Multitouch armed (scenario={scen}, display_cfg=0x{cfg:08x}).")
+            elif args.cmd == "leave-kb":
+                scen = ctrl.leave_keyboard()
+                print(f"Left keyboard (scenario={scen}).")
+            elif args.cmd == "drain":
+                print(f"Drained {ctrl.drain_stale_in()} bytes.")
+            elif args.cmd == "clear":
+                ctrl.enable_draw_mode()
+                ctrl.clear_screen(fill_byte=0x0F if args.black else 0xFF, waveform=WAVEFORM_INIT)
+                print("Cleared E-Ink screen.")
+            elif args.cmd == "waveform":
+                ctrl.set_waveform(WF_MAP[args.mode])
+                print(f"Set waveform to {args.mode}.")
+    except UsbError as exc:
+        print(f"USB Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

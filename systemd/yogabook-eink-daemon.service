@@ -1,0 +1,12 @@
+[Unit]
+Description=Yoga Book C930 E-Ink Settings Background Service (Linux EinkSvr)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yogabook-eink-cli daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

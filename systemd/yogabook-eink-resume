@@ -1,0 +1,10 @@
+#!/bin/sh
+# Systemd sleep hook: restore Yoga Book C930 E-Ink keyboard after suspend/resume.
+# Install to: /lib/systemd/system-sleep/yogabook-eink-resume
+
+case "$1" in
+  post)
+    sleep 1
+    /usr/local/bin/yogabook-eink-cli kb >/dev/null 2>&1 || true
+    ;;
+esac
